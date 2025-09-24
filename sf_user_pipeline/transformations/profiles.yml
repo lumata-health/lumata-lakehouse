@@ -1,0 +1,35 @@
+# dbt profiles configuration for sf_user pipeline
+# This file configures connections to AWS Athena for different environments
+
+sf_user_pipeline:
+  target: dev
+  outputs:
+    dev:
+      type: athena
+      s3_staging_dir: s3://lumata-lakehouse-development-athena-results/dbt/
+      region_name: us-east-1
+      database: sf_curated_development
+      schema: curated
+      work_group: primary
+      num_retries: 3
+      threads: 2
+      
+    staging:
+      type: athena
+      s3_staging_dir: s3://lumata-lakehouse-staging-athena-results/dbt/
+      region_name: us-east-1
+      database: sf_curated_staging
+      schema: curated
+      work_group: primary
+      num_retries: 3
+      threads: 4
+      
+    prod:
+      type: athena
+      s3_staging_dir: s3://lumata-lakehouse-prod-athena-results/dbt/
+      region_name: us-east-1
+      database: sf_curated
+      schema: curated
+      work_group: primary
+      num_retries: 3
+      threads: 8

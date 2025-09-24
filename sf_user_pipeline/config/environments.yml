@@ -1,0 +1,65 @@
+# Environment Configuration for sf_user Pipeline
+
+environments:
+  dev:
+    aws:
+      region: "us-east-1"
+      secrets:
+        salesforce_credentials: "salesforce/dev/credentials"
+      s3:
+        raw_bucket: "lumata-lakehouse-raw"
+        athena_results: "lumata-lakehouse-athena-results/dev/"
+      glue:
+        raw_database: "sf_raw_dev"
+        curated_database: "sf_curated_dev"
+    
+    pipeline:
+      schedule: "manual"
+      batch_size: 1000
+      
+  staging:
+    aws:
+      region: "us-east-1"
+      secrets:
+        salesforce_credentials: "salesforce/staging/credentials"
+      s3:
+        raw_bucket: "lumata-lakehouse-staging"
+        athena_results: "lumata-lakehouse-athena-results/staging/"
+      glue:
+        raw_database: "sf_raw_staging"
+        curated_database: "sf_curated_staging"
+    
+    pipeline:
+      schedule: "0 */12 * * *"  # Every 12 hours
+      batch_size: 5000
+      
+  prod:
+    aws:
+      region: "us-east-1"
+      secrets:
+        salesforce_credentials: "salesforce/production/credentials"
+      s3:
+        raw_bucket: "lumata-lakehouse-prod"
+        athena_results: "lumata-lakehouse-athena-results/prod/"
+      glue:
+        raw_database: "sf_raw"
+        curated_database: "sf_curated"
+    
+    pipeline:
+      schedule: "0 */6 * * *"   # Every 6 hours
+      batch_size: 10000
+
+# Global pipeline settings
+pipeline:
+  scd_config:
+    tracked_fields: ["division", "audit_phase__c"]
+    natural_key: "id"
+    effective_date_field: "lastmodifieddate"
+    
+  data_quality:
+    min_success_rate: 0.95
+    max_null_percentage: 0.05
+    
+  monitoring:
+    cloudwatch_log_group: "/aws/sf-user-pipeline"
+    sns_topic: "sf-user-pipeline-alerts"

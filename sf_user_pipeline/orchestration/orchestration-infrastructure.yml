@@ -1,0 +1,565 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'sf_user Pipeline Orchestration Infrastructure - Step Functions and EventBridge'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment for the pipeline deployment
+  
+  AccountId:
+    Type: String
+    Description: AWS Account ID for resource ARNs
+  
+  GlueJobName:
+    Type: String
+    Default: sf-user-ingestion-job
+    Description: Name of the AWS Glue job for sf_user ingestion
+  
+  S3BucketName:
+    Type: String
+    Default: lumata-salesforce-lakehouse-iceberg-dev
+    Description: S3 bucket for Iceberg tables and pipeline artifacts
+
+Resources:
+  # IAM Role for Step Functions execution
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'sf-user-pipeline-stepfunctions-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:BatchStopJobRun
+                Resource: !Sub 'arn:aws:glue:${AWS::Region}:${AccountId}:job/${GlueJobName}'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AccountId}:function:sf-user-pipeline-validator'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AccountId}:function:sf-user-dbt-runner'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AccountId}:function:sf-user-metrics-publisher'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AccountId}:function:sf-user-error-handler'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AccountId}:log-group:/aws/stepfunctions/sf-user-pipeline*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref PipelineAlertsTopic
+
+  # Step Functions State Machine
+  SfUserPipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub 'sf-user-pipeline-${Environment}'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+      TracingConfiguration:
+        Enabled: true
+      DefinitionString: !Sub |
+        {
+          "Comment": "sf_user Pipeline Orchestration - Coordinates Glue job ingestion followed by dbt transformations",
+          "StartAt": "ValidateInputs",
+          "States": {
+            "ValidateInputs": {
+              "Type": "Pass",
+              "Comment": "Validate pipeline execution parameters",
+              "Parameters": {
+                "execution_id.$": "$$.Execution.Name",
+                "start_time.$": "$$.Execution.StartTime",
+                "pipeline_name": "sf_user_pipeline",
+                "environment.$": "$.environment",
+                "force_full_refresh.$": "$.force_full_refresh"
+              },
+              "Next": "StartGlueJobIngestion"
+            },
+            "StartGlueJobIngestion": {
+              "Type": "Task",
+              "Comment": "Start AWS Glue job for sf_user data ingestion from Salesforce",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${GlueJobName}",
+                "Arguments": {
+                  "--execution_id.$": "$.execution_id",
+                  "--environment.$": "$.environment",
+                  "--force_full_refresh.$": "$.force_full_refresh",
+                  "--enable-continuous-cloudwatch-log": "true",
+                  "--enable-metrics": "true"
+                }
+              },
+              "ResultPath": "$.glue_job_result",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "HandleGlueJobFailure",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "ValidateGlueJobResults"
+            },
+            "ValidateGlueJobResults": {
+              "Type": "Task",
+              "Comment": "Validate Glue job execution results and data quality",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "sf-user-pipeline-validator",
+                "Payload": {
+                  "validation_type": "glue_job_results",
+                  "glue_job_result.$": "$.glue_job_result",
+                  "execution_id.$": "$.execution_id",
+                  "environment.$": "$.environment"
+                }
+              },
+              "ResultPath": "$.validation_result",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "HandleValidationFailure",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "CheckDataQuality"
+            },
+            "CheckDataQuality": {
+              "Type": "Choice",
+              "Comment": "Check if data quality validation passed",
+              "Choices": [
+                {
+                  "Variable": "$.validation_result.Payload.data_quality_passed",
+                  "BooleanEquals": true,
+                  "Next": "StartDbtTransformations"
+                }
+              ],
+              "Default": "HandleDataQualityFailure"
+            },
+            "StartDbtTransformations": {
+              "Type": "Task",
+              "Comment": "Execute dbt transformations for sf_user SCD Type 2 processing",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "sf-user-dbt-runner",
+                "Payload": {
+                  "command": "run",
+                  "models": "sf_user_pipeline",
+                  "environment.$": "$.environment",
+                  "execution_id.$": "$.execution_id",
+                  "force_full_refresh.$": "$.force_full_refresh",
+                  "vars": {
+                    "glue_job_run_id.$": "$.glue_job_result.JobRunId"
+                  }
+                }
+              },
+              "ResultPath": "$.dbt_run_result",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "HandleDbtRunFailure",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "RunDbtTests"
+            },
+            "RunDbtTests": {
+              "Type": "Task",
+              "Comment": "Execute dbt tests for data quality and SCD integrity validation",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "sf-user-dbt-runner",
+                "Payload": {
+                  "command": "test",
+                  "models": "sf_user_pipeline",
+                  "environment.$": "$.environment",
+                  "execution_id.$": "$.execution_id",
+                  "vars": {
+                    "glue_job_run_id.$": "$.glue_job_result.JobRunId"
+                  }
+                }
+              },
+              "ResultPath": "$.dbt_test_result",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "HandleDbtTestFailure",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "ValidateSCDIntegrity"
+            },
+            "ValidateSCDIntegrity": {
+              "Type": "Task",
+              "Comment": "Validate SCD Type 2 integrity and historical tracking correctness",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "sf-user-pipeline-validator",
+                "Payload": {
+                  "validation_type": "scd_integrity",
+                  "dbt_test_result.$": "$.dbt_test_result",
+                  "execution_id.$": "$.execution_id",
+                  "environment.$": "$.environment"
+                }
+              },
+              "ResultPath": "$.scd_validation_result",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "HandleSCDValidationFailure",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "PublishMetrics"
+            },
+            "PublishMetrics": {
+              "Type": "Task",
+              "Comment": "Publish pipeline execution metrics to CloudWatch",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "sf-user-metrics-publisher",
+                "Payload": {
+                  "execution_id.$": "$.execution_id",
+                  "environment.$": "$.environment",
+                  "glue_job_result.$": "$.glue_job_result",
+                  "dbt_run_result.$": "$.dbt_run_result",
+                  "dbt_test_result.$": "$.dbt_test_result",
+                  "scd_validation_result.$": "$.scd_validation_result",
+                  "start_time.$": "$.start_time"
+                }
+              },
+              "ResultPath": "$.metrics_result",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Next": "PipelineSuccess"
+            },
+            "PipelineSuccess": {
+              "Type": "Pass",
+              "Comment": "Pipeline completed successfully",
+              "Parameters": {
+                "status": "SUCCESS",
+                "execution_id.$": "$.execution_id",
+                "message": "sf_user pipeline completed successfully",
+                "glue_records_processed.$": "$.glue_job_result.Arguments.--records-processed",
+                "dbt_models_run.$": "$.dbt_run_result.Payload.models_run",
+                "dbt_tests_passed.$": "$.dbt_test_result.Payload.tests_passed",
+                "scd_records_created.$": "$.scd_validation_result.Payload.scd_records_created",
+                "execution_duration_minutes.$": "$.metrics_result.Payload.execution_duration_minutes"
+              },
+              "End": true
+            },
+            "HandleGlueJobFailure": {
+              "Type": "Task",
+              "Comment": "Handle Glue job execution failure",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "sf-user-error-handler",
+                "Payload": {
+                  "error_type": "glue_job_failure",
+                  "error_details.$": "$.error",
+                  "execution_id.$": "$.execution_id",
+                  "environment.$": "$.environment"
+                }
+              },
+              "ResultPath": "$.error_handling_result",
+              "Next": "PipelineFailure"
+            },
+            "HandleValidationFailure": {
+              "Type": "Task",
+              "Comment": "Handle data validation failure",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "sf-user-error-handler",
+                "Payload": {
+                  "error_type": "validation_failure",
+                  "error_details.$": "$.error",
+                  "execution_id.$": "$.execution_id",
+                  "environment.$": "$.environment"
+                }
+              },
+              "ResultPath": "$.error_handling_result",
+              "Next": "PipelineFailure"
+            },
+            "HandleDataQualityFailure": {
+              "Type": "Task",
+              "Comment": "Handle data quality validation failure",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "sf-user-error-handler",
+                "Payload": {
+                  "error_type": "data_quality_failure",
+                  "validation_result.$": "$.validation_result",
+                  "execution_id.$": "$.execution_id",
+                  "environment.$": "$.environment"
+                }
+              },
+              "ResultPath": "$.error_handling_result",
+              "Next": "PipelineFailure"
+            },
+            "HandleDbtRunFailure": {
+              "Type": "Task",
+              "Comment": "Handle dbt run failure",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "sf-user-error-handler",
+                "Payload": {
+                  "error_type": "dbt_run_failure",
+                  "error_details.$": "$.error",
+                  "execution_id.$": "$.execution_id",
+                  "environment.$": "$.environment"
+                }
+              },
+              "ResultPath": "$.error_handling_result",
+              "Next": "PipelineFailure"
+            },
+            "HandleDbtTestFailure": {
+              "Type": "Task",
+              "Comment": "Handle dbt test failure",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "sf-user-error-handler",
+                "Payload": {
+                  "error_type": "dbt_test_failure",
+                  "error_details.$": "$.error",
+                  "execution_id.$": "$.execution_id",
+                  "environment.$": "$.environment"
+                }
+              },
+              "ResultPath": "$.error_handling_result",
+              "Next": "PipelineFailure"
+            },
+            "HandleSCDValidationFailure": {
+              "Type": "Task",
+              "Comment": "Handle SCD validation failure",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "sf-user-error-handler",
+                "Payload": {
+                  "error_type": "scd_validation_failure",
+                  "error_details.$": "$.error",
+                  "execution_id.$": "$.execution_id",
+                  "environment.$": "$.environment"
+                }
+              },
+              "ResultPath": "$.error_handling_result",
+              "Next": "PipelineFailure"
+            },
+            "PipelineFailure": {
+              "Type": "Pass",
+              "Comment": "Pipeline failed - all error handling completed",
+              "Parameters": {
+                "status": "FAILED",
+                "execution_id.$": "$.execution_id",
+                "error_handling_result.$": "$.error_handling_result",
+                "message": "sf_user pipeline failed - check error handling results for details"
+              },
+              "End": true
+            }
+          }
+        }
+
+  # CloudWatch Log Group for Step Functions
+  StepFunctionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/stepfunctions/sf-user-pipeline-${Environment}'
+      RetentionInDays: 30
+
+  # IAM Role for EventBridge to invoke Step Functions
+  EventBridgeStepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'sf-user-pipeline-eventbridge-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgeStepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref SfUserPipelineStateMachine
+
+  # EventBridge Schedule for 6-hourly execution
+  SfUserPipelineSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'sf-user-pipeline-schedule-${Environment}'
+      Description: '6-hourly execution schedule for sf_user pipeline'
+      State: ENABLED
+      ScheduleExpression: 'rate(6 hours)'
+      Targets:
+        - Arn: !Ref SfUserPipelineStateMachine
+          Id: 'SfUserPipelineTarget'
+          RoleArn: !GetAtt EventBridgeStepFunctionsRole.Arn
+          Input: !Sub |
+            {
+              "environment": "${Environment}",
+              "force_full_refresh": false,
+              "scheduled_execution": true,
+              "execution_source": "eventbridge_schedule"
+            }
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAge: 3600
+          DeadLetterConfig:
+            Arn: !GetAtt PipelineDeadLetterQueue.Arn
+
+  # Dead Letter Queue for failed EventBridge executions
+  PipelineDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'sf-user-pipeline-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 300
+
+  # SNS Topic for pipeline alerts
+  PipelineAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'sf-user-pipeline-alerts-${Environment}'
+      DisplayName: 'sf_user Pipeline Alerts'
+
+  # CloudWatch Alarm for Step Functions failures
+  StepFunctionsFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'sf-user-pipeline-failures-${Environment}'
+      AlarmDescription: 'Alert when sf_user pipeline executions fail'
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref SfUserPipelineStateMachine
+      AlarmActions:
+        - !Ref PipelineAlertsTopic
+
+  # CloudWatch Alarm for Step Functions duration
+  StepFunctionsDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'sf-user-pipeline-duration-${Environment}'
+      AlarmDescription: 'Alert when sf_user pipeline takes longer than expected'
+      MetricName: ExecutionTime
+      Namespace: AWS/States
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3600000  # 1 hour in milliseconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref SfUserPipelineStateMachine
+      AlarmActions:
+        - !Ref PipelineAlertsTopic
+
+Outputs:
+  StateMachineArn:
+    Description: 'ARN of the sf_user pipeline Step Functions state machine'
+    Value: !Ref SfUserPipelineStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachineArn'
+
+  EventBridgeRuleArn:
+    Description: 'ARN of the EventBridge rule for pipeline scheduling'
+    Value: !GetAtt SfUserPipelineSchedule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleArn'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for pipeline alerts'
+    Value: !Ref PipelineAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  DeadLetterQueueUrl:
+    Description: 'URL of the dead letter queue for failed executions'
+    Value: !Ref PipelineDeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueUrl'

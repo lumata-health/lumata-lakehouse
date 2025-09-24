@@ -1,0 +1,408 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'sf_user Pipeline Monitoring and Alerting Infrastructure'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment for the monitoring deployment
+  
+  AccountId:
+    Type: String
+    Description: AWS Account ID for resource ARNs
+  
+  StateMachineArn:
+    Type: String
+    Description: ARN of the sf_user pipeline Step Functions state machine
+  
+  GlueJobName:
+    Type: String
+    Default: sf-user-ingestion-job
+    Description: Name of the AWS Glue job for sf_user ingestion
+  
+  SNSTopicArn:
+    Type: String
+    Description: ARN of the SNS topic for pipeline alerts
+  
+  AlertEmail:
+    Type: String
+    Description: Email address for pipeline alerts
+    Default: ""
+
+Resources:
+  # CloudWatch Log Groups
+  GlueJobLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/glue/jobs/${GlueJobName}'
+      RetentionInDays: 30
+
+  DbtRunnerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/sf-user-dbt-runner-${Environment}'
+      RetentionInDays: 30
+
+  PipelineValidatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/sf-user-pipeline-validator-${Environment}'
+      RetentionInDays: 30
+
+  MetricsPublisherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/sf-user-metrics-publisher-${Environment}'
+      RetentionInDays: 30
+
+  ErrorHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/sf-user-error-handler-${Environment}'
+      RetentionInDays: 30
+
+  # Custom CloudWatch Metrics Dashboard
+  SfUserPipelineDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'sf-user-pipeline-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/States", "ExecutionsSucceeded", "StateMachineArn", "${StateMachineArn}" ],
+                  [ ".", "ExecutionsFailed", ".", "." ],
+                  [ ".", "ExecutionsStarted", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Step Functions Executions",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/States", "ExecutionTime", "StateMachineArn", "${StateMachineArn}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Pipeline Execution Duration",
+                "period": 300,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Glue", "glue.driver.aggregate.numCompletedTasks", "JobName", "${GlueJobName}", "JobRunId", "ALL" ],
+                  [ ".", "glue.driver.aggregate.numFailedTasks", ".", ".", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Glue Job Task Metrics",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "SfUserPipeline", "RecordsProcessed", "Environment", "${Environment}", "JobType", "Ingestion" ],
+                  [ ".", "RecordsCreated", ".", ".", "JobType", "SCD" ],
+                  [ ".", "RecordsUpdated", ".", ".", ".", "." ],
+                  [ ".", "RecordsDeleted", ".", ".", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "sf_user Data Processing Metrics",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "SfUserPipeline", "DataQualityScore", "Environment", "${Environment}" ],
+                  [ ".", "SCDIntegrityScore", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Data Quality Metrics",
+                "period": 300,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/stepfunctions/sf-user-pipeline-${Environment}'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Pipeline Errors",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for Pipeline Monitoring
+
+  # Step Functions Failure Alarm
+  StepFunctionsFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'sf-user-pipeline-failures-${Environment}'
+      AlarmDescription: 'Alert when sf_user pipeline executions fail'
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref StateMachineArn
+      AlarmActions:
+        - !Ref SNSTopicArn
+      TreatMissingData: notBreaching
+
+  # Step Functions Duration Alarm
+  StepFunctionsDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'sf-user-pipeline-duration-${Environment}'
+      AlarmDescription: 'Alert when sf_user pipeline takes longer than expected'
+      MetricName: ExecutionTime
+      Namespace: AWS/States
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3600000  # 1 hour in milliseconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref StateMachineArn
+      AlarmActions:
+        - !Ref SNSTopicArn
+      TreatMissingData: notBreaching
+
+  # Glue Job Failure Alarm
+  GlueJobFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'sf-user-glue-job-failures-${Environment}'
+      AlarmDescription: 'Alert when Glue job fails'
+      MetricName: glue.driver.aggregate.numFailedTasks
+      Namespace: AWS/Glue
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: JobName
+          Value: !Ref GlueJobName
+        - Name: JobRunId
+          Value: ALL
+      AlarmActions:
+        - !Ref SNSTopicArn
+      TreatMissingData: notBreaching
+
+  # Data Quality Score Alarm
+  DataQualityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'sf-user-data-quality-low-${Environment}'
+      AlarmDescription: 'Alert when data quality score drops below threshold'
+      MetricName: DataQualityScore
+      Namespace: SfUserPipeline
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 95
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: Environment
+          Value: !Ref Environment
+      AlarmActions:
+        - !Ref SNSTopicArn
+      TreatMissingData: breaching
+
+  # SCD Integrity Alarm
+  SCDIntegrityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'sf-user-scd-integrity-issues-${Environment}'
+      AlarmDescription: 'Alert when SCD integrity issues are detected'
+      MetricName: SCDIntegrityScore
+      Namespace: SfUserPipeline
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 98
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: Environment
+          Value: !Ref Environment
+      AlarmActions:
+        - !Ref SNSTopicArn
+      TreatMissingData: breaching
+
+  # Record Volume Anomaly Alarm
+  RecordVolumeAnomalyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'sf-user-record-volume-anomaly-${Environment}'
+      AlarmDescription: 'Alert when record processing volume is anomalous'
+      MetricName: RecordsProcessed
+      Namespace: SfUserPipeline
+      Statistic: Sum
+      Period: 21600  # 6 hours to match pipeline frequency
+      EvaluationPeriods: 1
+      Threshold: 100  # Minimum expected records
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: Environment
+          Value: !Ref Environment
+        - Name: JobType
+          Value: Ingestion
+      AlarmActions:
+        - !Ref SNSTopicArn
+      TreatMissingData: breaching
+
+  # Lambda Function Error Alarms
+  DbtRunnerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'sf-user-dbt-runner-errors-${Environment}'
+      AlarmDescription: 'Alert when dbt runner Lambda function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub 'sf-user-dbt-runner-${Environment}'
+      AlarmActions:
+        - !Ref SNSTopicArn
+      TreatMissingData: notBreaching
+
+  ValidatorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'sf-user-validator-errors-${Environment}'
+      AlarmDescription: 'Alert when pipeline validator Lambda function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub 'sf-user-pipeline-validator-${Environment}'
+      AlarmActions:
+        - !Ref SNSTopicArn
+      TreatMissingData: notBreaching
+
+  # Composite Alarm for Overall Pipeline Health
+  PipelineHealthCompositeAlarm:
+    Type: AWS::CloudWatch::CompositeAlarm
+    Properties:
+      AlarmName: !Sub 'sf-user-pipeline-health-${Environment}'
+      AlarmDescription: 'Composite alarm for overall sf_user pipeline health'
+      AlarmRule: !Sub |
+        ALARM(${StepFunctionsFailureAlarm}) OR
+        ALARM(${GlueJobFailureAlarm}) OR
+        ALARM(${DataQualityAlarm}) OR
+        ALARM(${SCDIntegrityAlarm}) OR
+        ALARM(${DbtRunnerErrorAlarm}) OR
+        ALARM(${ValidatorErrorAlarm})
+      AlarmActions:
+        - !Ref SNSTopicArn
+
+  # SNS Email Subscription (if email provided)
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref SNSTopicArn
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Outputs:
+  DashboardURL:
+    Description: 'URL of the CloudWatch dashboard for sf_user pipeline monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${SfUserPipelineDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  CompositeAlarmArn:
+    Description: 'ARN of the composite alarm for pipeline health'
+    Value: !GetAtt PipelineHealthCompositeAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CompositeAlarmArn'
+
+  LogGroups:
+    Description: 'List of CloudWatch log groups created'
+    Value: !Sub |
+      ${GlueJobLogGroup},${DbtRunnerLogGroup},${PipelineValidatorLogGroup},${MetricsPublisherLogGroup},${ErrorHandlerLogGroup}
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroups'

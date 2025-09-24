@@ -1,0 +1,46 @@
+# Lumata Lakehouse Configuration
+
+lakehouse:
+  name: "lumata-lakehouse"
+  version: "1.0.0"
+  description: "Modern data lakehouse for Lumata Health analytics"
+
+# Global AWS configuration
+aws:
+  region: "us-east-1"
+  account_id: "${AWS_ACCOUNT_ID}"
+  
+  # S3 buckets
+  storage:
+    raw: "lumata-lakehouse-raw"
+    staging: "lumata-lakehouse-staging" 
+    prod: "lumata-lakehouse-prod"
+    athena_results: "lumata-lakehouse-athena-results"
+  
+  # Glue Catalog
+  catalog:
+    name: "glue_catalog"
+    
+# Data formats and standards
+data:
+  format: "iceberg"
+  compression: "snappy"
+  partitioning_strategy: "time_based"
+  
+# Security
+security:
+  encryption_at_rest: true
+  encryption_in_transit: true
+  kms_key: "alias/lumata-lakehouse-key"
+  
+# Monitoring
+monitoring:
+  cloudwatch_log_group: "/aws/lumata-lakehouse"
+  metrics_namespace: "LumataLakehouse"
+  
+# Pipelines
+pipelines:
+  - name: "sf_user_pipeline"
+    path: "./sf_user_pipeline"
+    description: "Salesforce sf_user data with SCD Type 2"
+    status: "active"

@@ -1,0 +1,48 @@
+# dbt Profiles Configuration for sf_user Pipeline
+# This file configures the connection to AWS Glue/Athena for Iceberg tables
+
+sf_user_pipeline:
+  target: dev
+  outputs:
+    dev:
+      type: athena
+      s3_staging_dir: s3://lumata-datalake-athena-results/dev/
+      s3_data_dir: s3://lumata-datalake-raw/
+      region_name: us-east-1
+      database: sf_curated
+      schema: sf_curated
+      work_group: primary
+      num_retries: 3
+      
+      # Iceberg-specific configurations
+      table_type: iceberg
+      
+      # Performance optimizations
+      poll_interval: 1
+      aws_profile_name: default  # Use default AWS profile or IAM role
+      
+    staging:
+      type: athena
+      s3_staging_dir: s3://lumata-datalake-athena-results/staging/
+      s3_data_dir: s3://lumata-datalake-staging/
+      region_name: us-east-1
+      database: sf_curated_staging
+      schema: sf_curated_staging
+      work_group: primary
+      num_retries: 3
+      table_type: iceberg
+      poll_interval: 1
+      aws_profile_name: default
+      
+    prod:
+      type: athena
+      s3_staging_dir: s3://lumata-datalake-athena-results/prod/
+      s3_data_dir: s3://lumata-datalake-prod/
+      region_name: us-east-1
+      database: sf_curated_prod
+      schema: sf_curated_prod
+      work_group: primary
+      num_retries: 3
+      table_type: iceberg
+      poll_interval: 1
+      aws_profile_name: default

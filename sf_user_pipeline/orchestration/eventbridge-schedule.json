@@ -1,0 +1,29 @@
+{
+  "Name": "sf-user-pipeline-schedule",
+  "Description": "6-hourly execution schedule for sf_user pipeline",
+  "State": "ENABLED",
+  "ScheduleExpression": "rate(6 hours)",
+  "ScheduleExpressionTimezone": "UTC",
+  "FlexibleTimeWindow": {
+    "Mode": "FLEXIBLE",
+    "MaximumWindowInMinutes": 15
+  },
+  "Target": {
+    "Arn": "arn:aws:states:us-east-1:ACCOUNT_ID:stateMachine:sf-user-pipeline",
+    "RoleArn": "arn:aws:iam::ACCOUNT_ID:role/EventBridgeStepFunctionsRole",
+    "Input": {
+      "environment": "production",
+      "force_full_refresh": false,
+      "scheduled_execution": true,
+      "execution_source": "eventbridge_schedule"
+    },
+    "RetryPolicy": {
+      "MaximumRetryAttempts": 2,
+      "MaximumEventAge": 3600
+    },
+    "DeadLetterConfig": {
+      "Arn": "arn:aws:sqs:us-east-1:ACCOUNT_ID:sf-user-pipeline-dlq"
+    }
+  },
+  "KmsKeyId": "arn:aws:kms:us-east-1:ACCOUNT_ID:key/sf-user-pipeline-key"
+}
