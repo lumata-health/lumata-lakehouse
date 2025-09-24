@@ -1,0 +1,65 @@
+version: 2
+
+models:
+  - name: stg_sf_user
+    description: "Staging model for sf_user data with basic cleaning and standardization"
+    
+    columns:
+      - name: id
+        description: "Salesforce User ID (Primary Key)"
+        tests:
+          - not_null
+          - unique
+          
+      - name: name
+        description: "User full name (cleaned and trimmed)"
+        tests:
+          - not_null
+          
+      - name: division
+        description: "User division (standardized case, SCD tracked field)"
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['North', 'South', 'East', 'West', 'Central']
+              
+      - name: audit_phase__c
+        description: "Custom audit phase field (standardized case, SCD tracked field)"
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['Phase1', 'Phase2', 'Phase3', 'Complete']
+              
+      - name: isactive
+        description: "User active status"
+        tests:
+          - not_null
+          - accepted_values:
+              values: [true, false]
+              
+      - name: isdeleted
+        description: "User deleted status"
+        tests:
+          - not_null
+          - accepted_values:
+              values: [true, false]
+              
+      - name: lastmodifieddate
+        description: "Record last modified timestamp"
+        tests:
+          - not_null
+          
+      - name: createddate
+        description: "Record creation timestamp"
+        tests:
+          - not_null
+          
+      - name: _extracted_at
+        description: "Extraction timestamp from source system"
+        tests:
+          - not_null
+          
+      - name: _extraction_run_id
+        description: "Extraction run identifier"
+        tests:
+          - not_null

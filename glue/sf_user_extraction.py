@@ -15,7 +15,7 @@ from awsglue.transforms import *
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
-from aws_glue_job import Job
+from awsglue.job import Job
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import *
 from pyspark.sql.types import *
@@ -148,29 +148,23 @@ def write_to_iceberg(df, table_path):
         raise
 
 def log_and_notify_error(message):
-    """Logs an error message and sends a notification to SNS."""
+    """Logs an error message."""
     print(message)
-    sns_client = boto3.client('sns', region_name=env_config['aws']['region'])
-    sns_client.publish(
-        TopicArn=monitoring_config['alerts']['sns_topic'],
-        Message=message,
-        Subject=f"Glue Job Failed: {args['JOB_NAME']}"
-    )
 
 def main():
     """Main execution function for the Glue job."""
     try:
         # Get the last successful run timestamp from Glue job bookmarks
         last_run_timestamp = None
-        if 'last_successful_run' in job.get_job_bookmark():
-            last_run_timestamp = job.get_job_bookmark()['last_successful_run']
+        job_bookmark = glueContext.job_bookmark_node
+        last_run_timestamp = job_bookmark.get_last_run_info().get('last_successful_run')
 
         credentials = get_salesforce_credentials()
         sf_connection = connect_to_salesforce(credentials)
         df = extract_sf_user_data(sf_connection, last_run_timestamp)
 
         if df:
-            iceberg_path = f"s3://{env_config['aws']['s3']['raw_bucket']}/iceberg/sf_user"
+            iceberg_path = "s3://lumata-salesforce-lakehouse-iceberg-dev/iceberg/salesforce_raw/sf_user"
             write_to_iceberg(df, iceberg_path)
 
         # Set the job bookmark to the current timestamp

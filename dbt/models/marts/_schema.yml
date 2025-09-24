@@ -1,0 +1,53 @@
+version: 2
+
+models:
+  - name: dim_sf_user
+    description: "Dimension model for sf_user with SCD Type 2 history"
+    
+    columns:
+      - name: id
+        description: "Salesforce User ID (Primary Key)"
+        tests:
+          - not_null
+          
+      - name: name
+        description: "User full name"
+        
+      - name: division
+        description: "User division (SCD tracked field)"
+        
+      - name: audit_phase__c
+        description: "Custom audit phase field (SCD tracked field)"
+        
+      - name: isactive
+        description: "User active status"
+        
+      - name: isdeleted
+        description: "User deleted status"
+        
+      - name: lastmodifieddate
+        description: "Record last modified timestamp"
+        
+      - name: createddate
+        description: "Record creation timestamp"
+        
+      - name: _extracted_at
+        description: "Extraction timestamp from source system"
+        
+      - name: _extraction_run_id
+        description: "Extraction run identifier"
+        
+      - name: dwh_start_ts
+        description: "Timestamp when the record version became active"
+        tests:
+          - not_null
+          
+      - name: dwh_end_ts
+        description: "Timestamp when the record version became inactive"
+        
+      - name: dwh_active_flag
+        description: "Flag to indicate if the record version is currently active"
+        tests:
+          - not_null
+          - accepted_values:
+              values: [true, false]

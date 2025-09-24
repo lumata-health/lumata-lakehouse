@@ -1,0 +1,10 @@
+version: 2
+
+sources:
+  - name: sf_raw
+    description: "Raw Salesforce data ingested from the Glue job."
+    database: "{{ target.database }}"
+    schema: "sf_raw"
+    tables:
+      - name: sf_user
+        description: "Raw sf_user data from Salesforce."

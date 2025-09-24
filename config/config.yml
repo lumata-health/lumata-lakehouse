@@ -34,7 +34,7 @@ environments:
       secrets_manager:
         salesforce_credentials: "salesforce/dev/credentials"
       s3:
-        raw_bucket: "lumata-lakehouse-raw-dev"
+        raw_bucket: "lumata-salesforce-lakehouse-iceberg-dev"
         staging_bucket: "lumata-lakehouse-staging-dev"
         athena_results: "lumata-lakehouse-athena-results-dev"
       glue:
@@ -111,7 +111,7 @@ monitoring:
       unit: "percentage"
 
   alerts:
-    sns_topic: "arn:aws:sns:us-east-1:ACCOUNT:sf-user-pipeline-alerts"
+    sns_topic: "arn:aws:sns:us-east-1:282815445946:sf-user-pipeline-alerts"
     email_recipients:
       - "data-engineering@company.com"
       - "devops@company.com"
