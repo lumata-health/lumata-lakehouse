@@ -1,12 +1,11 @@
-# Pipeline Configuration for sf_user Data Processing
-# This file contains environment-specific and global pipeline settings
+# Unified Pipeline Configuration for sf_user Data Processing
 
 # Global pipeline settings
 pipeline:
   name: "sf_user_pipeline"
   version: "1.0.0"
   description: "Salesforce sf_user data pipeline with SCD Type 2 implementation"
-  
+
   # SCD Type 2 configuration
   scd_config:
     tracked_fields: ["division", "audit_phase__c"]
@@ -14,71 +13,77 @@ pipeline:
     effective_date_field: "lastmodifieddate"
     current_flag_field: "is_current"
     deleted_flag_field: "is_deleted"
-    
+
   # Data quality thresholds
   data_quality:
     min_success_rate: 0.95
     max_null_percentage: 0.05
     max_duplicate_percentage: 0.01
-    
+
   # Performance settings
   performance:
     batch_size: 10000
     max_parallel_jobs: 4
     query_timeout_seconds: 3600
-    
+
 # Environment-specific configurations
 environments:
-  development:
+  dev:
     aws:
       region: "us-east-1"
       secrets_manager:
-        salesforce_credentials: "salesforce/development/credentials"
+        salesforce_credentials: "salesforce/dev/credentials"
       s3:
-        raw_bucket: "lumata-lakehouse-development-raw"
-        staging_bucket: "lumata-lakehouse-development-staging"
-        athena_results: "lumata-lakehouse-development-athena-results/dev/"
+        raw_bucket: "lumata-lakehouse-raw-dev"
+        staging_bucket: "lumata-lakehouse-staging-dev"
+        athena_results: "lumata-lakehouse-athena-results-dev"
       glue:
-        raw_database: "sf_raw_development"
-        curated_database: "sf_curated_development"
-        
+        raw_database: "sf_raw_dev"
+        curated_database: "sf_curated_dev"
     dbt:
       target: "dev"
       threads: 2
-      
+    pipeline:
+      schedule: "manual"
+      batch_size: 1000
+
   staging:
     aws:
       region: "us-east-1"
       secrets_manager:
         salesforce_credentials: "salesforce/staging/credentials"
       s3:
-        raw_bucket: "lumata-lakehouse-staging-raw"
+        raw_bucket: "lumata-lakehouse-raw-staging"
         staging_bucket: "lumata-lakehouse-staging-staging"
-        athena_results: "lumata-lakehouse-staging-athena-results/staging/"
+        athena_results: "lumata-lakehouse-athena-results-staging"
       glue:
         raw_database: "sf_raw_staging"
         curated_database: "sf_curated_staging"
-        
     dbt:
       target: "staging"
       threads: 4
-      
-  production:
+    pipeline:
+      schedule: "0 */12 * * *"  # Every 12 hours
+      batch_size: 5000
+
+  prod:
     aws:
       region: "us-east-1"
       secrets_manager:
         salesforce_credentials: "salesforce/production/credentials"
       s3:
-        raw_bucket: "lumata-lakehouse-prod-raw"
-        staging_bucket: "lumata-lakehouse-prod-staging"
-        athena_results: "lumata-lakehouse-prod-athena-results/prod/"
+        raw_bucket: "lumata-lakehouse-raw-prod"
+        staging_bucket: "lumata-lakehouse-staging-prod"
+        athena_results: "lumata-lakehouse-athena-results-prod"
       glue:
-        raw_database: "sf_raw"
-        curated_database: "sf_curated"
-        
+        raw_database: "sf_raw_prod"
+        curated_database: "sf_curated_prod"
     dbt:
       target: "prod"
       threads: 8
+    pipeline:
+      schedule: "0 */6 * * *"   # Every 6 hours
+      batch_size: 10000
 
 # Monitoring and alerting configuration
 monitoring:
@@ -87,36 +92,36 @@ monitoring:
       glue: "/aws/glue/jobs/sf-user-extraction"
       dbt: "/aws/dbt/sf_user_pipeline"
       pipeline: "/aws/pipeline/sf_user_pipeline"
-      
+
   metrics:
     - name: "extraction_duration"
       threshold: 1800  # 30 minutes
       unit: "seconds"
-      
+
     - name: "transformation_duration"
       threshold: 900   # 15 minutes
       unit: "seconds"
-      
+
     - name: "records_processed"
       threshold: 1000
       unit: "count"
-      
+
     - name: "data_quality_score"
       threshold: 0.95
       unit: "percentage"
-      
+
   alerts:
     sns_topic: "arn:aws:sns:us-east-1:ACCOUNT:sf-user-pipeline-alerts"
     email_recipients:
       - "data-engineering@company.com"
       - "devops@company.com"
-    
+
     conditions:
       - metric: "extraction_duration"
         operator: ">"
         threshold: 1800
         severity: "warning"
-        
+
       - metric: "data_quality_score"
         operator: "<"
         threshold: 0.90
@@ -128,11 +133,11 @@ security:
     at_rest: true
     in_transit: true
     kms_key_id: "alias/lumata-lakehouse-key"
-    
+
   access_control:
     enable_rbac: true
     default_permissions: "read_only"
-    
+
   audit:
     enable_cloudtrail: true
     log_data_access: true
@@ -141,16 +146,16 @@ security:
 # Scheduling configuration
 scheduling:
   orchestrator: "aws_step_functions"  # or "airflow", "prefect"
-  
+
   schedules:
     full_refresh:
       cron: "0 2 * * 0"  # Weekly on Sunday at 2 AM UTC
       enabled: true
-      
+
     incremental:
       cron: "0 */6 * * *"  # Every 6 hours
       enabled: true
-      
+
     data_quality_check:
       cron: "0 8 * * *"   # Daily at 8 AM UTC
       enabled: true
@@ -160,7 +165,7 @@ backup:
   enable_point_in_time_recovery: true
   backup_retention_days: 30
   cross_region_backup: false
-  
+
 # Cost optimization
 cost_optimization:
   enable_s3_intelligent_tiering: true
