@@ -2,9 +2,9 @@
 
 ## Overview
 
-This design document outlines the technical architecture for a focused Salesforce sf_user data pipeline using dbtHub for ingestion and dbt Core for transformations. The architecture implements a streamlined 3-component solution: **dbtHub → Salesforce API → Iceberg Tables → dbt Core → Iceberg Marts → Athena/Trino**.
+This design document outlines the technical architecture for a focused Salesforce sf_user data pipeline using AWS Glue jobs for ingestion and dbt Core for transformations. The architecture implements a streamlined AWS-native solution: **AWS Glue → Salesforce API → Iceberg Tables → dbt Core → Iceberg Marts → Athena**.
 
-The design prioritizes simplicity and maintainability while providing SCD Type 2 implementation specifically for sf_user data, tracking historical changes in Division and Audit_Phase__c fields.
+The design prioritizes AWS-native integration, scalability, and maintainability while providing SCD Type 2 implementation specifically for sf_user data, tracking historical changes in Division and Audit_Phase__c fields.
 
 ## Architecture
 
@@ -12,33 +12,39 @@ The design prioritizes simplicity and maintainability while providing SCD Type 2
 
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Salesforce    │    │     dbtHub      │    │  Iceberg Tables │
-│   (sf_user)     │───▶│   Ingestion     │───▶│   (Raw Layer)   │
+│   Salesforce    │    │   AWS Glue      │    │  Iceberg Tables │
+│   (sf_user)     │───▶│   Job           │───▶│   (Raw Layer)   │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+                                │                       │
+                                ▼                       ▼
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│ AWS Secrets     │    │   S3 Bucket     │    │  AWS Glue       │
+│ Manager         │    │   (Iceberg)     │    │  Catalog        │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
                                                         │
                                                         ▼
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│ Athena/Trino    │◀───│  Iceberg Tables │◀───│   dbt Core      │
+│ Amazon Athena   │◀───│  Iceberg Tables │◀───│   dbt Core      │
 │   (Analytics)   │    │ (SCD Layer)     │    │ (Transformations)│
 └─────────────────┘    └─────────────────┘    └─────────────────┘
                                                         ▲
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Monitoring    │◀───│ Orchestration   │───▶│   Scheduling    │
-│   (Alerts)      │    │   (Workflow)    │    │   (Triggers)    │
+│   CloudWatch    │◀───│ Step Functions  │───▶│   EventBridge   │
+│   (Monitoring)  │    │ (Orchestration) │    │   (Scheduling)  │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
 ```
 
 ### Component Architecture
 
 #### 1. Data Ingestion Layer
-- **dbtHub Framework**: Ingestion framework that handles Salesforce sf_user data fetching
-- **Salesforce API**: REST/Bulk API for sf_user data retrieval via dbtHub
-- **AWS Secrets Manager**: Existing Salesforce credentials for dbtHub authentication
-- **Data Loading Strategy**: Incremental loading with merge strategy for optimal performance
+- **AWS Glue Job**: Python-based ETL job that handles Salesforce sf_user data extraction and loading
+- **Salesforce API**: REST/Bulk API for sf_user data retrieval using simple-salesforce library
+- **AWS Secrets Manager**: Existing Salesforce credentials for authentication
+- **Data Loading Strategy**: Incremental loading with Iceberg merge strategy for optimal performance
 
 #### 2. Storage Layer
 - **Apache Iceberg Tables**: ACID-compliant table format for both raw and curated sf_user data
-- **Amazon S3**: Underlying storage for Iceberg tables
+- **Amazon S3**: Underlying storage at `s3://lumata-salesforce-lakehouse-iceberg-dev/iceberg/salesforce_raw/`
 - **AWS Glue Catalog**: Metadata management for Iceberg tables (queryable via Athena)
 
 #### 3. Transformation Layer
@@ -47,87 +53,166 @@ The design prioritizes simplicity and maintainability while providing SCD Type 2
 - **Incremental Models**: Efficient processing of sf_user updates
 
 #### 4. Orchestration Layer
-- **Workflow Engine**: Coordination of dbtHub ingestion and dbt transformations
-- **Scheduling**: Automated pipeline execution
+- **AWS Step Functions**: Coordination of Glue job ingestion and dbt transformations
+- **Amazon EventBridge**: Automated pipeline scheduling (every 6 hours)
 - **Event Triggers**: Change-based processing initiation
 
 #### 5. Monitoring Layer
-- **Logging**: Comprehensive pipeline execution logs
-- **Metrics**: Performance and data quality monitoring
-- **Alerting**: Failure and anomaly notifications
+- **CloudWatch Logs**: Comprehensive pipeline execution logs
+- **CloudWatch Metrics**: Performance and data quality monitoring
+- **SNS Alerting**: Failure and anomaly notifications
 
 ## Components and Interfaces
 
-### dbtHub Ingestion Engine
+### AWS Glue Ingestion Job
 
-**Purpose**: Extract sf_user data from Salesforce and write to raw Iceberg tables
+**Purpose**: Extract sf_user data from Salesforce and write to raw Iceberg tables in S3
 
 **Key Features**:
-- Declarative configuration for Salesforce sf_user extraction
+- Python-based ETL job using PySpark and simple-salesforce
 - Incremental extraction based on LastModifiedDate
-- Automatic schema detection and evolution
+- Native Iceberg support with Glue 4.0
 - Built-in error handling and retry logic
+- Integration with AWS Secrets Manager for credentials
 
-**Configuration Specifications**:
-```yaml
-# dbtHub source configuration
-sources:
-  - name: salesforce
-    type: salesforce
-    connection:
-      # Use existing AWS Secrets Manager credentials
-      credentials_source: aws_secrets_manager
-      secret_name: "salesforce/production/credentials"
-      region: "us-east-1"
-    
-    destination:
-      type: iceberg
-      catalog: glue_catalog
-      database: sf_raw
-      s3_location: "s3://data-lake-bucket/sf_raw/"
-    
-    tables:
-      - name: sf_user
-        identifier: User
-        destination_table: sf_user
-        loading_strategy:
-          type: incremental
-          strategy: merge
-          unique_key: Id
-          updated_at: LastModifiedDate
-          lookback_window: "1 hour"  # Safety buffer for late-arriving data
-          full_refresh_schedule: "weekly"  # Weekly full refresh for data integrity
-        columns:
-          - name: Id
-            type: string
-          - name: Name
-            type: string
-          - name: Division
-            type: string
-          - name: Audit_Phase__c
-            type: string
-          - name: LastModifiedDate
-            type: timestamp
-          - name: IsActive
-            type: boolean
-          - name: IsDeleted
-            type: boolean
+**Glue Job Configuration**:
+```python
+# Glue Job Parameters
+{
+    "Name": "sf-user-ingestion-job",
+    "Role": "arn:aws:iam::ACCOUNT:role/GlueServiceRole",
+    "Command": {
+        "Name": "glueetl",
+        "ScriptLocation": "s3://lumata-salesforce-lakehouse-config-dev/glue_scripts/sf_user_ingestion.py",
+        "PythonVersion": "3"
+    },
+    "DefaultArguments": {
+        "--job-language": "python",
+        "--enable-glue-datacatalog": "",
+        "--enable-continuous-cloudwatch-log": "true",
+        "--enable-spark-ui": "true",
+        "--spark-event-logs-path": "s3://lumata-salesforce-lakehouse-config-dev/spark-logs/",
+        "--additional-python-modules": "simple-salesforce==1.12.4,pyarrow==10.0.1",
+        "--conf": "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.glue_catalog.warehouse=s3://lumata-salesforce-lakehouse-iceberg-dev/iceberg/ --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO"
+    },
+    "GlueVersion": "4.0",
+    "MaxRetries": 2,
+    "Timeout": 2880,  # 48 hours
+    "MaxCapacity": 10
+}
 ```
 
-**Interface Specifications**:
+**Glue Job Script Structure**:
 ```python
-class dbtHubConnector:
-    def __init__(self, config_path: str):
-        self.config = self.load_config(config_path)
+# sf_user_ingestion.py
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from simple_salesforce import Salesforce
+import boto3
+import json
+from datetime import datetime, timedelta
+import logging
+
+class SalesforceIcebergIngestion:
+    def __init__(self, glue_context, spark_context):
+        self.glue_context = glue_context
+        self.spark = glue_context.spark_session
+        self.sc = spark_context
+        self.secrets_client = boto3.client('secretsmanager', region_name='us-east-1')
         
-    def extract_sf_user(self, incremental_date: datetime = None) -> bool:
-        """Extract sf_user data with incremental logic"""
+    def get_salesforce_credentials(self, secret_name: str) -> dict:
+        """Retrieve Salesforce credentials from AWS Secrets Manager"""
+        response = self.secrets_client.get_secret_value(SecretId=secret_name)
+        return json.loads(response['SecretString'])
+    
+    def connect_to_salesforce(self, credentials: dict) -> Salesforce:
+        """Establish connection to Salesforce"""
+        return Salesforce(
+            username=credentials['username'],
+            password=credentials['password'],
+            security_token=credentials['security_token'],
+            domain=credentials.get('domain', 'login')
+        )
+    
+    def get_last_run_timestamp(self) -> datetime:
+        """Get last successful run timestamp for incremental loading"""
+        # Implementation to read from Glue job bookmark or S3 metadata
+        pass
+    
+    def extract_sf_user_incremental(self, sf_connection: Salesforce, since_date: datetime) -> list:
+        """Extract sf_user data incrementally based on LastModifiedDate"""
+        soql_query = f"""
+        SELECT Id, Name, Division, Audit_Phase__c, LastModifiedDate, 
+               IsActive, IsDeleted, CreatedDate
+        FROM User 
+        WHERE LastModifiedDate > {since_date.isoformat()}
+        ORDER BY LastModifiedDate
+        """
         
-    def validate_schema(self) -> bool:
-        """Validate sf_user schema against Salesforce"""
+        result = sf_connection.query_all(soql_query)
+        return result['records']
+    
+    def write_to_iceberg(self, data: list, table_name: str):
+        """Write data to Iceberg table using merge strategy"""
+        if not data:
+            logging.info("No data to write")
+            return
+            
+        # Convert to Spark DataFrame
+        df = self.spark.createDataFrame(data)
         
-    def get_extraction_stats(self) -> Dict[str, int]:
-        """Return extraction statistics for monitoring"""
+        # Add extraction metadata
+        df = df.withColumn("_extracted_at", current_timestamp()) \
+               .withColumn("_extraction_run_id", lit(self.job_run_id))
+        
+        # Write to Iceberg table with merge strategy
+        df.writeTo(f"glue_catalog.salesforce_raw.{table_name}") \
+          .using("iceberg") \
+          .option("write-audit-publish", "true") \
+          .option("check-nullability", "false") \
+          .option("merge-schema", "true") \
+          .createOrReplace()
+    
+    def run_ingestion(self):
+        """Main ingestion process"""
+        try:
+            # Get credentials
+            credentials = self.get_salesforce_credentials("salesforce/production/credentials")
+            
+            # Connect to Salesforce
+            sf = self.connect_to_salesforce(credentials)
+            
+            # Get last run timestamp
+            last_run = self.get_last_run_timestamp()
+            
+            # Extract data
+            sf_user_data = self.extract_sf_user_incremental(sf, last_run)
+            
+            # Write to Iceberg
+            self.write_to_iceberg(sf_user_data, "sf_user")
+            
+            logging.info(f"Successfully processed {len(sf_user_data)} sf_user records")
+            
+        except Exception as e:
+            logging.error(f"Ingestion failed: {str(e)}")
+            raise
+
+# Glue job entry point
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# Run ingestion
+ingestion = SalesforceIcebergIngestion(glueContext, sc)
+ingestion.run_ingestion()
+
+job.commit()
 ```
 
 ### dbt Core Transformation Engine
@@ -221,7 +306,8 @@ snapshots:
 **Iceberg Table Schema Examples**:
 ```sql
 -- Raw sf_user Iceberg Table (queryable via Athena)
-CREATE TABLE glue_catalog.sf_raw.sf_user (
+-- Location: s3://lumata-salesforce-lakehouse-iceberg-dev/iceberg/salesforce_raw/sf_user/
+CREATE TABLE glue_catalog.salesforce_raw.sf_user (
     id string,
     name string,
     division string,
@@ -229,17 +315,21 @@ CREATE TABLE glue_catalog.sf_raw.sf_user (
     lastmodifieddate timestamp,
     isactive boolean,
     isdeleted boolean,
+    createddate timestamp,
     _extracted_at timestamp,
     _extraction_run_id string
 ) USING iceberg
+LOCATION 's3://lumata-salesforce-lakehouse-iceberg-dev/iceberg/salesforce_raw/sf_user/'
 PARTITIONED BY (days(_extracted_at))
 TBLPROPERTIES (
     'write.format.default'='parquet',
-    'write.parquet.compression-codec'='snappy'
+    'write.parquet.compression-codec'='snappy',
+    'format-version'='2'
 );
 
 -- Curated sf_user SCD Type 2 Iceberg Table (queryable via Athena)
-CREATE TABLE glue_catalog.sf_curated.dim_sf_user_scd (
+-- Location: s3://lumata-salesforce-lakehouse-iceberg-dev/iceberg/salesforce_curated/dim_sf_user_scd/
+CREATE TABLE glue_catalog.salesforce_curated.dim_sf_user_scd (
     user_key bigint,
     user_id string,
     name string,
@@ -252,10 +342,12 @@ CREATE TABLE glue_catalog.sf_curated.dim_sf_user_scd (
     _dbt_updated_at timestamp,
     _scd_id string
 ) USING iceberg
+LOCATION 's3://lumata-salesforce-lakehouse-iceberg-dev/iceberg/salesforce_curated/dim_sf_user_scd/'
 PARTITIONED BY (is_current, bucket(8, user_id))
 TBLPROPERTIES (
     'write.format.default'='parquet',
-    'write.parquet.compression-codec'='snappy'
+    'write.parquet.compression-codec'='snappy',
+    'format-version'='2'
 );
 ```
 
@@ -491,10 +583,11 @@ and is_current = true
 
 ### Error Categories and Responses
 
-**1. dbtHub Ingestion Errors**:
-- Salesforce API rate limiting: Built-in backoff and retry
-- Authentication failures: Credential refresh and retry
+**1. AWS Glue Job Ingestion Errors**:
+- Salesforce API rate limiting: Built-in backoff and retry with exponential backoff
+- Authentication failures: Credential refresh from Secrets Manager and retry
 - Network timeouts: Configurable retry with exponential backoff
+- Glue job failures: Automatic retry with Step Functions
 
 **2. Data Quality Errors**:
 - Schema mismatches: Log and continue with schema evolution
@@ -508,32 +601,41 @@ and is_current = true
 
 ### Error Handling Implementation
 
-```yaml
-# dbtHub error handling configuration
-error_handling:
-  salesforce_api:
-    max_retries: 3
-    backoff_factor: 2
-    timeout_seconds: 300
-    
-  data_quality:
-    on_schema_change: "warn_and_continue"
-    on_test_failure: "warn"
-    quarantine_invalid_records: true
-    
-  pipeline:
-    on_failure: "alert_and_stop"
-    retry_attempts: 2
-    notification_channels: ["email", "slack"]
+```python
+# AWS Glue job error handling configuration
+ERROR_HANDLING_CONFIG = {
+    "salesforce_api": {
+        "max_retries": 3,
+        "backoff_factor": 2,
+        "timeout_seconds": 300,
+        "rate_limit_retry_delay": 60
+    },
+    "data_quality": {
+        "on_schema_change": "warn_and_continue",
+        "on_validation_failure": "quarantine",
+        "quarantine_s3_path": "s3://lumata-salesforce-lakehouse-config-dev/quarantine/",
+        "max_error_percentage": 5
+    },
+    "glue_job": {
+        "max_retries": 2,
+        "timeout_minutes": 2880,  # 48 hours
+        "on_failure": "alert_and_stop"
+    },
+    "notifications": {
+        "sns_topic_arn": "arn:aws:sns:us-east-1:ACCOUNT:sf-user-pipeline-alerts",
+        "channels": ["email", "slack"]
+    }
+}
 ```
 
 ### Monitoring and Alerting
 
 **Pipeline Metrics**:
-- dbtHub ingestion duration and success rate
+- AWS Glue job duration and success rate
 - sf_user record counts and processing volumes
 - SCD processing statistics (new, updated, deleted records)
 - Data quality test results
+- Iceberg table statistics (snapshots, data files, manifest files)
 
 **Alert Triggers**:
 - Pipeline failures or timeouts
@@ -542,29 +644,39 @@ error_handling:
 - Unexpected data volume changes
 
 **Monitoring Configuration**:
-```yaml
-# Pipeline monitoring configuration
-monitoring:
-  metrics:
-    - name: "sf_user_ingestion_duration"
-      threshold: 1800  # 30 minutes
-      alert_on_exceed: true
-      
-    - name: "sf_user_record_count"
-      expected_range: [4000, 6000]
-      alert_on_deviation: 20  # 20% deviation
-      
-    - name: "scd_processing_success_rate"
-      threshold: 95  # 95% success rate
-      alert_on_below: true
-      
-  alerts:
-    channels: ["email", "slack"]
-    escalation_minutes: 30
-    
-  data_quality:
-    test_failure_threshold: 3
-    critical_tests: ["unique_user_id", "scd_integrity"]
+```python
+# CloudWatch monitoring configuration
+MONITORING_CONFIG = {
+    "cloudwatch_metrics": {
+        "namespace": "SalesforceIcebergPipeline",
+        "metrics": [
+            {
+                "name": "GlueJobDuration",
+                "threshold": 1800,  # 30 minutes
+                "comparison": "GreaterThanThreshold"
+            },
+            {
+                "name": "SfUserRecordCount", 
+                "expected_range": [4000, 6000],
+                "deviation_threshold": 20  # 20% deviation
+            },
+            {
+                "name": "DataQualityScore",
+                "threshold": 95,  # 95% success rate
+                "comparison": "LessThanThreshold"
+            }
+        ]
+    },
+    "cloudwatch_alarms": {
+        "sns_topic": "arn:aws:sns:us-east-1:ACCOUNT:sf-user-pipeline-alerts",
+        "escalation_minutes": 30
+    },
+    "log_groups": {
+        "glue_job": "/aws/glue/jobs/sf-user-ingestion-job",
+        "step_functions": "/aws/stepfunctions/sf-user-pipeline",
+        "dbt": "/aws/dbt/sf-user-transformations"
+    }
+}
 ```
 
 ## Testing Strategy
@@ -572,7 +684,7 @@ monitoring:
 ### Unit Testing
 - **dbt Models**: Test sf_user staging and SCD model logic with sample data
 - **SCD Macros**: Validate SCD Type 2 logic for Division and Audit_Phase__c tracking
-- **dbtHub Configuration**: Test Salesforce connection and extraction logic
+- **Glue Job Scripts**: Test Salesforce connection, extraction logic, and Iceberg writes
 
 ### Integration Testing
 - **End-to-End Pipeline**: Validate complete sf_user data flow from Salesforce to SCD tables
@@ -639,9 +751,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
-      - name: Test dbtHub configuration
+      - name: Test Glue job script
         run: |
-          dbthub validate --config dbtHub.yml
+          python -m pytest tests/test_glue_job.py
       - name: Run dbt tests
         run: |
           dbt deps
@@ -651,12 +763,15 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy dbtHub ingestion
+      - name: Deploy Glue job script to S3
         run: |
-          dbthub deploy --config dbtHub.yml --target prod
+          aws s3 cp glue_jobs/sf_user_ingestion.py s3://lumata-salesforce-lakehouse-config-dev/glue_scripts/
+      - name: Update Glue job
+        run: |
+          aws glue update-job --job-name sf-user-ingestion-job --job-update file://glue_job_config.json
       - name: Deploy dbt models
         run: |
           dbt run --profiles-dir ./profiles --target prod --models sf_user_pipeline
 ```
 
-This design provides a focused, maintainable solution for sf_user data processing with SCD Type 2 implementation, leveraging modern tools like dbtHub and dbt Core for simplified architecture and operations.
+This design provides a focused, maintainable solution for sf_user data processing with SCD Type 2 implementation, leveraging AWS-native services like Glue jobs and dbt Core for scalable, cloud-native architecture and operations.
